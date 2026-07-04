@@ -1,8 +1,8 @@
-package com.example.data.database
+package com.example.core.database
 
 import androidx.room.*
-import com.example.data.model.OptimizationLog
-import com.example.data.model.DeviceScoreLog
+import com.example.core.model.OptimizationLog
+import com.example.core.model.DeviceScoreLog
 import kotlinx.coroutines.flow.Flow
 
 @Dao

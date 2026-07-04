@@ -30,8 +30,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.example.data.model.DeviceScoreLog
-import com.example.data.model.OptimizationLog
+import com.example.core.model.DeviceScoreLog
+import com.example.core.model.OptimizationLog
 import com.example.viewmodel.MainViewModel
 import java.text.SimpleDateFormat
 import java.util.*

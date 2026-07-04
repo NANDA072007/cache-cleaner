@@ -1,6 +1,6 @@
 {
-  "name": "SmartBoost AI",
-  "description": "An intelligent local Android device optimizer with visual storage analysis, junk cleaner, memory & battery insights, and real-time CPU monitoring.",
+  "name": "SmartBoost",
+  "description": "A high-performance local Android device optimizer with visual storage analysis, junk cleaner, memory & battery insights, and real-time CPU monitoring.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

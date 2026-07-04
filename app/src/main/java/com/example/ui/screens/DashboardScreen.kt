@@ -38,7 +38,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.navigation.NavController
-import com.example.data.model.RecommendationItem
+import com.example.core.model.RecommendationItem
 import com.example.viewmodel.MainViewModel
 
 @OptIn(ExperimentalLayoutApi::class)

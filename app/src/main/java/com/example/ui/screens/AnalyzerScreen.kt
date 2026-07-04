@@ -28,8 +28,8 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.example.data.model.StorageItem
-import com.example.data.repository.DeviceScanner
+import com.example.core.model.StorageItem
+import com.example.core.monitor.StorageMonitor
 import com.example.viewmodel.MainViewModel
 import androidx.compose.ui.graphics.vector.ImageVector
 
@@ -166,7 +166,7 @@ fun AnalyzerScreen(
 @Composable
 fun DiskBreakdownTab(
     viewModel: MainViewModel,
-    storageUsage: DeviceScanner.StorageUsage,
+    storageUsage: StorageMonitor.StorageState,
     downloadsSize: Long,
     apksSize: Long,
     cacheSize: Long,

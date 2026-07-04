@@ -19,8 +19,8 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
-import com.example.data.database.AppDatabase
-import com.example.data.repository.SettingsRepository
+import com.example.core.database.AppDatabase
+import com.example.core.settings.SettingsRepository
 import com.example.ui.navigation.Screen
 import com.example.ui.screens.*
 import com.example.ui.theme.MyApplicationTheme

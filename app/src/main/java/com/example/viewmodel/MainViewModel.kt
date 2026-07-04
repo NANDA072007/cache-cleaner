@@ -2,22 +2,30 @@ package com.example.viewmodel
 
 import android.app.ActivityManager
 import android.content.Context
-import android.os.SystemClock
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
-import com.example.data.database.AppDatabase
-import com.example.data.database.OptimizerDao
-import com.example.data.model.AppInfoItem
-import com.example.data.model.DeviceScoreLog
-import com.example.data.model.OptimizationLog
-import com.example.data.model.RecommendationItem
-import com.example.data.model.StorageItem
-import com.example.data.repository.AppManager
-import com.example.data.repository.DeviceScanner
-import com.example.data.repository.RecommendationEngine
-import com.example.data.repository.SettingsRepository
+import com.example.core.database.AppDatabase
+import com.example.core.database.OptimizerDao
+import com.example.core.model.AppInfoItem
+import com.example.core.model.DeviceScoreLog
+import com.example.core.model.OptimizationLog
+import com.example.core.model.RecommendationItem
+import com.example.core.model.StorageItem
+import com.example.core.monitor.SystemMonitor
+import com.example.core.scanner.JunkScanner
+import com.example.core.scanner.JunkClassifier
+import com.example.core.scanner.JunkAnalyzer
+import com.example.core.scanner.RecommendationEngine
+import com.example.core.scanner.ReportGenerator
+import com.example.core.apps.AppManager
+import com.example.core.settings.SettingsRepository
+import com.example.core.logging.Logger
+import com.example.core.event.EventBus
+import com.example.core.event.AppEvent
+import com.example.core.background.BackgroundTaskManager
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
@@ -30,29 +38,32 @@ class MainViewModel(
 ) : ViewModel() {
 
     private val optimizerDao: OptimizerDao = database.optimizerDao()
-    private val deviceScanner = DeviceScanner(context)
+    private val systemMonitor = SystemMonitor(context)
     private val appManager = AppManager(context)
+    private val junkScanner = JunkScanner(context)
+    private val junkClassifier = JunkClassifier()
+    private val junkAnalyzer = JunkAnalyzer()
     private val recommendationEngine = RecommendationEngine()
+    private val reportGenerator = ReportGenerator()
+    private val backgroundTaskManager = BackgroundTaskManager(context)
 
-    // --- SCAN STATES ---
+    // --- PIPELINE SCAN STATES ---
     private val _isScanning = MutableStateFlow(false)
     val isScanning: StateFlow<Boolean> = _isScanning.asStateFlow()
 
     private val _scanProgressText = MutableStateFlow("Ready to scan")
     val scanProgressText: StateFlow<String> = _scanProgressText.asStateFlow()
 
-    // --- REAL SYSTEM DATA FLOWS ---
-    private val _storageUsage = MutableStateFlow(deviceScanner.getStorageUsage())
-    val storageUsage: StateFlow<DeviceScanner.StorageUsage> = _storageUsage.asStateFlow()
+    private val _isPaused = MutableStateFlow(false)
+    val isPaused: StateFlow<Boolean> = _isPaused.asStateFlow()
 
-    private val _memoryUsage = MutableStateFlow(deviceScanner.getMemoryUsage())
-    val memoryUsage: StateFlow<DeviceScanner.MemoryUsage> = _memoryUsage.asStateFlow()
+    private var scanJob: Job? = null
 
-    private val _batteryStatus = MutableStateFlow(deviceScanner.getBatteryStatus())
-    val batteryStatus: StateFlow<DeviceScanner.BatteryStatus> = _batteryStatus.asStateFlow()
-
-    private val _cpuStatus = MutableStateFlow(deviceScanner.getCpuStatus())
-    val cpuStatus: StateFlow<DeviceScanner.CpuStatus> = _cpuStatus.asStateFlow()
+    // --- REAL SYSTEM DATA FLOWS FROM SYSTEM MONITOR ---
+    val storageUsage = systemMonitor.storageState
+    val memoryUsage = systemMonitor.memoryState
+    val batteryStatus = systemMonitor.batteryState
+    val cpuStatus = systemMonitor.cpuState
 
     private val _storageItems = MutableStateFlow<List<StorageItem>>(emptyList())
     val storageItems: StateFlow<List<StorageItem>> = _storageItems.asStateFlow()
@@ -72,6 +83,10 @@ class MainViewModel(
     )
     val scores: StateFlow<Map<String, Int>> = _scores.asStateFlow()
 
+    // --- REPORT DATA FLOW ---
+    private val _healthReport = MutableStateFlow<ReportGenerator.DeviceHealthReport?>(null)
+    val healthReport: StateFlow<ReportGenerator.DeviceHealthReport?> = _healthReport.asStateFlow()
+
     // --- DATABASE HISTORICAL DATA FLOWS ---
     val optimizationHistory: StateFlow<List<OptimizationLog>> = optimizerDao.getAllOptimizationLogs()
         .flowOn(Dispatchers.IO)
@@ -90,73 +105,119 @@ class MainViewModel(
     val privacyMode = settingsRepository.privacyMode.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), false)
 
     init {
-        // Run light metrics update immediately
-        refreshSystemMetrics()
-        // Start live CPU & Memory updates every 2 seconds
+        Logger.i(message = "Initializing Platform ViewModel architecture...")
+        
+        // Start live unified monitors (updates every 3 seconds)
+        systemMonitor.start(3000)
+
+        // Initialize background tasks WorkManager
         viewModelScope.launch {
-            while (true) {
-                delay(2000)
-                if (!_isScanning.value) {
-                    _cpuStatus.value = deviceScanner.getCpuStatus()
-                    _memoryUsage.value = deviceScanner.getMemoryUsage()
+            autoScanDaily.collect { enabled ->
+                if (enabled) {
+                    backgroundTaskManager.scheduleAllTasks()
+                } else {
+                    backgroundTaskManager.cancelAllTasks()
                 }
+            }
+        }
+
+        // Listen for EventBus notifications to update score metrics dynamically
+        viewModelScope.launch {
+            EventBus.events.collect { event ->
+                Logger.d(message = "Event received on internal bus: $event")
+                when (event) {
+                    is AppEvent.StorageChanged, is AppEvent.BatteryChanged,
+                    is AppEvent.LowStorage, is AppEvent.LowMemory -> {
+                        recalculateScores()
+                    }
+                    else -> {}
+                }
+            }
+        }
+
+        // Keep local health analytics report synced with metrics and optimization runs
+        viewModelScope.launch {
+            combine(
+                storageUsage,
+                memoryUsage,
+                batteryStatus,
+                cpuStatus,
+                optimizationHistory,
+                scoreHistory
+            ) { array ->
+                val s = array[0] as com.example.core.monitor.StorageMonitor.StorageState
+                val m = array[1] as com.example.core.monitor.MemoryMonitor.MemoryState
+                val b = array[2] as com.example.core.monitor.BatteryMonitor.BatteryState
+                val c = array[3] as com.example.core.monitor.CpuMonitor.CpuState
+                val o = array[4] as List<OptimizationLog>
+                val h = array[5] as List<DeviceScoreLog>
+                reportGenerator.generateReport(s, m, b, c, o, h)
+            }.collect { report ->
+                _healthReport.value = report
             }
         }
     }
 
     fun refreshSystemMetrics() {
-        _storageUsage.value = deviceScanner.getStorageUsage()
-        _memoryUsage.value = deviceScanner.getMemoryUsage()
-        _batteryStatus.value = deviceScanner.getBatteryStatus()
-        _cpuStatus.value = deviceScanner.getCpuStatus()
+        systemMonitor.forceRefresh()
         recalculateScores()
     }
 
     fun runFullScan() {
-        viewModelScope.launch {
+        scanJob?.cancel()
+        _isPaused.value = false
+        scanJob = viewModelScope.launch {
             _isScanning.value = true
-            _scanProgressText.value = "Starting Diagnostic Scan..."
+            _scanProgressText.value = "Starting Pipeline Scan..."
+            Logger.i(message = "Scan pipeline: STARTED")
             delay(500)
 
-            _scanProgressText.value = "Analyzing CPU Core States..."
-            _cpuStatus.value = deviceScanner.getCpuStatus()
+            _scanProgressText.value = "Phase 1: Querying Telemetry Monitors..."
+            systemMonitor.forceRefresh()
             delay(400)
 
-            _scanProgressText.value = "Reading RAM Page Tables..."
-            _memoryUsage.value = deviceScanner.getMemoryUsage()
-            delay(400)
-
-            _scanProgressText.value = "Polling Battery Health parameters..."
-            _batteryStatus.value = deviceScanner.getBatteryStatus()
-            delay(400)
-
-            _scanProgressText.value = "Parsing Installed Application structures..."
-            val appsList = appManager.getInstalledApps()
+            _scanProgressText.value = "Phase 2: App Manager catalog sweep..."
+            val appsList = withContext(Dispatchers.IO) { appManager.getInstalledApps() }
             _installedApps.value = appsList
             delay(400)
 
-            _scanProgressText.value = "Mapping system disk contents..."
-            val filesList = deviceScanner.scanStorageFiles { progress ->
-                _scanProgressText.value = progress
+            _scanProgressText.value = "Phase 3: Directory content scan..."
+            val rawFiles = try {
+                junkScanner.scan { label, _ ->
+                    _scanProgressText.value = label
+                }
+            } catch (e: Exception) {
+                Logger.e(message = "Scan phase 3 error", throwable = e)
+                emptyList()
             }
-            _storageItems.value = filesList
-            delay(500)
 
-            _scanProgressText.value = "Formulating diagnostic advice..."
-            // Generate real hardware-driven recommendation lists
+            _scanProgressText.value = "Phase 4: Classifying sector categories..."
+            val classifiedItems = withContext(Dispatchers.Default) {
+                rawFiles.map { junkClassifier.classify(it) }
+            }
+            delay(300)
+
+            _scanProgressText.value = "Phase 5: Duplicate files analytics..."
+            val finalizedStorageItems = withContext(Dispatchers.Default) {
+                junkAnalyzer.analyze(classifiedItems)
+            }
+            _storageItems.value = finalizedStorageItems
+            delay(400)
+
+            _scanProgressText.value = "Phase 6: Recommendation engine sweep..."
             val advice = recommendationEngine.generateRecommendations(
-                storageUsage = _storageUsage.value,
-                memoryUsage = _memoryUsage.value,
-                batteryStatus = _batteryStatus.value,
-                cpuStatus = _cpuStatus.value,
-                storageItems = filesList,
+                storageUsage = storageUsage.value,
+                memoryUsage = memoryUsage.value,
+                batteryStatus = batteryStatus.value,
+                cpuStatus = cpuStatus.value,
+                storageItems = finalizedStorageItems,
                 installedApps = appsList
             )
             _recommendations.value = advice
 
             recalculateScores()
 
-            // Save the newly calculated diagnostic score to persistent history
+            // Persist the diagnostics result
             withContext(Dispatchers.IO) {
                 optimizerDao.insertDeviceScoreLog(
                     DeviceScoreLog(
@@ -170,16 +231,43 @@ class MainViewModel(
             }
 
             _scanProgressText.value = "Diagnostics Complete!"
+            Logger.i(message = "Scan pipeline: COMPLETED")
             delay(400)
             _isScanning.value = false
         }
     }
 
+    fun pauseScan() {
+        viewModelScope.launch {
+            junkScanner.pause()
+            _isPaused.value = true
+            _scanProgressText.value = "Scan paused"
+            Logger.i(message = "Scan pipeline: PAUSED")
+        }
+    }
+
+    fun resumeScan() {
+        viewModelScope.launch {
+            junkScanner.resume()
+            _isPaused.value = false
+            _scanProgressText.value = "Resuming scan..."
+            Logger.i(message = "Scan pipeline: RESUMED")
+        }
+    }
+
+    fun cancelScan() {
+        scanJob?.cancel()
+        _isScanning.value = false
+        _isPaused.value = false
+        _scanProgressText.value = "Scan cancelled"
+        Logger.i(message = "Scan pipeline: CANCELLED")
+    }
+
     private fun recalculateScores() {
-        val sUsage = _storageUsage.value
-        val mUsage = _memoryUsage.value
-        val bStatus = _batteryStatus.value
-        val cStatus = _cpuStatus.value
+        val sUsage = storageUsage.value
+        val mUsage = memoryUsage.value
+        val bStatus = batteryStatus.value
+        val cStatus = cpuStatus.value
 
         // Compute scores logically based on real values
         val storageScore = (100 - sUsage.usedPercentage).coerceIn(40, 100)
@@ -203,7 +291,7 @@ class MainViewModel(
     fun cleanJunk(selectedItems: List<StorageItem>, onComplete: (Long) -> Unit) {
         viewModelScope.launch {
             _isScanning.value = true
-            _scanProgressText.value = "Initiating Junk Clean sequence..."
+            _scanProgressText.value = "Initiating Clean sequence..."
             delay(500)
 
             var bytesFreed = 0L
@@ -212,13 +300,25 @@ class MainViewModel(
             for (item in selectedItems) {
                 _scanProgressText.value = "Deleting ${item.name} (${formatSize(item.size)})..."
                 val success = withContext(Dispatchers.IO) {
-                    deviceScanner.deleteFileItem(item)
+                    try {
+                        if (item.file.exists()) {
+                            if (item.file.isDirectory) {
+                                item.file.deleteRecursively()
+                            } else {
+                                item.file.delete()
+                            }
+                        } else {
+                            true
+                        }
+                    } catch (e: Exception) {
+                        false
+                    }
                 }
                 if (success) {
                     bytesFreed += item.size
                     fileCount++
                 }
-                delay(15) // Smooth visible, completely non-blocking UI transition
+                delay(15)
             }
 
             // Add log entry to SQLite Room
@@ -228,25 +328,26 @@ class MainViewModel(
                         OptimizationLog(
                             type = "JUNK_CLEAN",
                             bytesFreed = bytesFreed,
-                            description = "Purged $fileCount junk/temporary items from local directories."
+                            description = "Purged $fileCount junk items. Recovered ${formatSize(bytesFreed)} space."
                         )
                     )
                 }
+                EventBus.emit(AppEvent.CleanupCompleted(bytesFreed, fileCount))
             }
 
-            // Reload file scanner
+            // Reload files
             val updatedFiles = _storageItems.value.filterNot { item -> selectedItems.any { it.path == item.path } }
             _storageItems.value = updatedFiles
-
-            // Refresh system storage values
-            _storageUsage.value = deviceScanner.getStorageUsage()
             
-            // Re-eval advice
+            // Refresh storage monitor
+            systemMonitor.forceRefresh()
+            
+            // Re-eval recommendations
             _recommendations.value = recommendationEngine.generateRecommendations(
-                storageUsage = _storageUsage.value,
-                memoryUsage = _memoryUsage.value,
-                batteryStatus = _batteryStatus.value,
-                cpuStatus = _cpuStatus.value,
+                storageUsage = storageUsage.value,
+                memoryUsage = memoryUsage.value,
+                batteryStatus = batteryStatus.value,
+                cpuStatus = cpuStatus.value,
                 storageItems = updatedFiles,
                 installedApps = _installedApps.value
             )
@@ -269,18 +370,15 @@ class MainViewModel(
             var processKillCount = 0
 
             withContext(Dispatchers.IO) {
-                // Execute standard garbage collector request
                 System.gc()
                 Runtime.getRuntime().gc()
 
-                // Query and close actually running background services and cached app processes
                 val activityManager = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
                 if (activityManager != null) {
                     try {
                         val runningProcesses = activityManager.runningAppProcesses
                         if (runningProcesses != null) {
                             for (procInfo in runningProcesses) {
-                                // Filter out foreground application processes and our own app
                                 if (procInfo.importance > ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND && procInfo.pkgList != null) {
                                     for (pkgName in procInfo.pkgList) {
                                         if (pkgName != context.packageName) {
@@ -292,7 +390,6 @@ class MainViewModel(
                             }
                         }
                     } catch (e: Exception) {
-                        // Secure fallback: kill top known candidates from memory lists
                         _installedApps.value.take(5).forEach { app ->
                             try {
                                 activityManager?.killBackgroundProcesses(app.packageName)
@@ -302,30 +399,27 @@ class MainViewModel(
                     }
                 }
 
-                // Log memory boost
                 optimizerDao.insertOptimizationLog(
                     OptimizationLog(
                         type = "MEMORY_BOOST",
-                        bytesFreed = 0L, // Memory boost is operational (pages freed), not static storage
-                        description = "System Garbage Collector invoked. Released memory from $processKillCount background processes."
+                        bytesFreed = 0L,
+                        description = "Released heap space from $processKillCount background apps."
                     )
                 )
             }
 
-            _memoryUsage.value = deviceScanner.getMemoryUsage()
-            _cpuStatus.value = deviceScanner.getCpuStatus()
+            systemMonitor.forceRefresh()
             recalculateScores()
 
-            _scanProgressText.value = "Memory pages optimized!"
+            _scanProgressText.value = "Memory allocations boosted!"
             delay(800)
             _isScanning.value = false
-            onComplete("System Garbage Collection triggered. Reclaimed background allocations.")
+            onComplete("System allocations boosted. Released memory registers.")
         }
     }
 
     fun optimizeBattery(onComplete: () -> Unit) {
         viewModelScope.launch {
-            // Simulated operational settings logs
             withContext(Dispatchers.IO) {
                 optimizerDao.insertOptimizationLog(
                     OptimizationLog(
@@ -358,6 +452,11 @@ class MainViewModel(
         val units = arrayOf("B", "KB", "MB", "GB", "TB")
         val digitGroups = (Math.log10(bytes.toDouble()) / Math.log10(1024.0)).toInt()
         return String.format("%.2f %s", bytes / Math.pow(1024.0, digitGroups.toDouble()), units[digitGroups])
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        systemMonitor.stop()
     }
 }
 

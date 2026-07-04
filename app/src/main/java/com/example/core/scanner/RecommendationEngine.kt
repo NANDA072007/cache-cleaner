@@ -1,23 +1,32 @@
-package com.example.data.repository
+package com.example.core.scanner
 
-import com.example.data.model.RecommendationItem
-import com.example.data.model.StorageItem
-import com.example.data.model.AppInfoItem
+import com.example.core.model.RecommendationItem
+import com.example.core.model.StorageItem
+import com.example.core.model.AppInfoItem
+import com.example.core.monitor.StorageMonitor
+import com.example.core.monitor.MemoryMonitor
+import com.example.core.monitor.BatteryMonitor
+import com.example.core.monitor.CpuMonitor
 
 class RecommendationEngine {
 
     fun generateRecommendations(
-        storageUsage: DeviceScanner.StorageUsage,
-        memoryUsage: DeviceScanner.MemoryUsage,
-        batteryStatus: DeviceScanner.BatteryStatus,
-        cpuStatus: DeviceScanner.CpuStatus,
+        storageUsage: StorageMonitor.StorageState,
+        memoryUsage: MemoryMonitor.MemoryState,
+        batteryStatus: BatteryMonitor.BatteryState,
+        cpuStatus: CpuMonitor.CpuState,
         storageItems: List<StorageItem>,
         installedApps: List<AppInfoItem>
     ): List<RecommendationItem> {
         val recommendations = mutableListOf<RecommendationItem>()
 
         // 1. Storage checks
-        val storageFreePct = (storageUsage.freeBytes.toFloat() / storageUsage.totalBytes.toFloat()) * 100f
+        val storageFreePct = if (storageUsage.totalBytes > 0) {
+            (storageUsage.freeBytes.toFloat() / storageUsage.totalBytes.toFloat()) * 100f
+        } else {
+            100f
+        }
+
         if (storageFreePct < 15f) {
             recommendations.add(
                 RecommendationItem(

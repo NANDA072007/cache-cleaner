@@ -27,7 +27,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.example.data.model.AppInfoItem
+import com.example.core.model.AppInfoItem
 import com.example.viewmodel.MainViewModel
 import java.text.SimpleDateFormat
 import java.util.*
